@@ -7,7 +7,7 @@ gets it.
 ```python
 import os, sys
 from pathlib import Path
-sys.path.insert(0, os.path.expanduser("~/.tclaude/skills/html-viewer/scripts"))
+sys.path.insert(0, "SKILL_DIR/scripts")  # absolute path of this skill's scripts/
 import viewer_kit as vk
 
 ROOT = Path(__file__).resolve().parent   # the directory you will serve

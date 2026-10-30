@@ -28,8 +28,8 @@ Python 3.8+, standard library only.
 git clone https://github.com/caseclose/html-viewer-skill ~/.claude/skills/html-viewer
 ```
 
-The docs reference `~/.tclaude/skills/html-viewer`; if you install elsewhere, update
-that path in `SKILL.md` and `references/page-recipe.md`.
+For a single project instead, clone into `<project>/.claude/skills/html-viewer`.
+The skill locates its scripts relative to its own directory, so either location works.
 
 ### Use without Claude
 
@@ -71,7 +71,7 @@ never exposes itself to the network; doing that is left to the user, deliberatel
 git clone https://github.com/caseclose/html-viewer-skill ~/.claude/skills/html-viewer
 ```
 
-文档里写的路径是 `~/.tclaude/skills/html-viewer`；如果装在别的位置，请同步修改 `SKILL.md` 和 `references/page-recipe.md` 里的路径。
+只给某个项目用的话，克隆到 `<项目>/.claude/skills/html-viewer`。skill 按自身所在目录定位脚本，两种位置都能用。
 
 ### 不通过 Claude 直接使用
 

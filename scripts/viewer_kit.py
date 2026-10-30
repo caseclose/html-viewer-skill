@@ -5,7 +5,7 @@ looks. Output is one self-contained HTML file: CSS and JS are inlined, nothing i
 loaded from a CDN, images are linked by path relative to the served directory.
 
     import os, sys
-    sys.path.insert(0, os.path.expanduser("~/.tclaude/skills/html-viewer/scripts"))
+    sys.path.insert(0, os.path.expanduser("~/.claude/skills/html-viewer/scripts"))
     import viewer_kit as vk
 
     root = Path(__file__).resolve().parent          # the directory you serve

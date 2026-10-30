@@ -14,10 +14,10 @@ served from their own machine. Three pieces, all in `scripts/`:
 | `viewer_kit.py` | The component library: theme, layout, tables, cards, tabs, filters, galleries, timelines. Build scripts import it. |
 | `serve_viewer.py` | Serves a directory on 127.0.0.1 with a per-session key; lists and stops viewers. |
 
-`SKILL_DIR` below means the directory containing this file
-(`~/.tclaude/skills/html-viewer` here; adjust the paths in this file and in
-`references/page-recipe.md` if installed elsewhere, e.g. `~/.claude/skills/html-viewer`). Needs Python 3.8+; on hosts where `python3` is
-older, use `python3.9`/`python3.11` or a venv interpreter (`python3 -V` first).
+`SKILL_DIR` below means the directory containing this `SKILL.md` (for a personal
+install, `~/.claude/skills/html-viewer`); substitute its absolute path in the
+commands. Needs Python 3.8+; on hosts where `python3` is older, use
+`python3.9`/`python3.11` or a venv interpreter (`python3 -V` first).
 
 ## Workflow
 
@@ -52,7 +52,7 @@ script never contains CSS:
 
 ```python
 import os, sys
-sys.path.insert(0, os.path.expanduser("~/.tclaude/skills/html-viewer/scripts"))
+sys.path.insert(0, "SKILL_DIR/scripts")  # absolute path of this skill's scripts/
 import viewer_kit as vk
 ```
 
