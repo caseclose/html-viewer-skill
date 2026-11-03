@@ -1,8 +1,8 @@
 # Page recipe
 
-Build scripts import `viewer_kit` and assemble pages from its helpers. Don't put
-CSS in build scripts; if the kit lacks something, add it to the kit so every page
-gets it.
+Build scripts import `viewer_kit` and assemble pages from its helpers. Reuse the
+kit's theme and components; keep task-specific extensions in the build script
+instead of changing the installed skill.
 
 ```python
 import os, sys
@@ -46,7 +46,7 @@ vk.set_lang("zh")                        # or "en"; call before building content
 | `call(name, arguments, aside=)` | A function/API/tool invocation with its arguments. |
 | `kv([(k, v), ...])` | Metadata table; values may be Html. |
 | `gallery([(path, caption[, thumb]), ...], root, hero=, size=)` | Images; click → lightbox, ←/→ within the card. |
-| `badge(label, kind)` · `chip(label, value)` · `meter(value, max, label=, kind=)` · `link(href, label)` | Inline bits. |
+| `badge(label, kind)` · `chip(label, value)` · `meter(value, maximum=1.0, label=, kind=)` · `link(href, label)` | Inline bits. |
 | `raw(html)` · `esc(s)` · `rel(path, root)` · `fmt(value)` | Escape hatch / helpers. |
 
 **Tones**: `info, success, accent, warn, highlight, danger, muted`. Anywhere a
@@ -132,10 +132,18 @@ browser can Ctrl-F beats many, so only split when a page gets slow.
 ## Gotchas
 
 - **Relative paths.** `gallery`/`img` take `root`; pass the directory you serve.
-  Files outside it 404 — symlink them in or serve a common parent.
+  They encode Chinese, spaces and URL delimiters. Files outside the served root
+  are not reachable: stage intended assets inside it, or inspect the contents
+  before serving a common parent. See [serving.md](serving.md).
 - **Thumbnails.** If the data has thumbnails, pass them as the third tuple element;
   the lightbox still opens the full file.
 - **Escaping.** Data often contains `<script>`, `&`, `<`; helpers escape, raw
   f-strings don't.
 - **Encoding.** Read and write with `encoding="utf-8"`.
 - **Language.** `vk.set_lang("en")` before building for English labels.
+- **Repeated tabs.** Each `tabs()` call generates a unique ID. Supply `tab_id=`
+  only when you need a stable ID, and keep it unique on the page.
+- **Trust boundary.** `raw()` is for trusted markup built by your script. Do not
+  pass source records or user text through it to bypass escaping.
+- **Limits and metrics.** Label sampled subsets and truncation. A rate calculated
+  from loaded records is not automatically a rate for the full dataset.

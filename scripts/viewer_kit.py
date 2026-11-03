@@ -29,6 +29,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+from urllib.parse import quote
+from uuid import uuid4
 
 # --------------------------------------------------------------------- tones
 # Colour is semantic. Pick the tone by what the thing *is*, not to decorate.
@@ -97,9 +99,9 @@ def esc(value: Any) -> str:
 def rel(path: str | os.PathLike, root: str | os.PathLike) -> str:
     """Absolute path on disk -> URL relative to the served directory."""
     try:
-        return Path(os.path.relpath(path, root)).as_posix()
-    except ValueError:
-        return str(path)
+        return quote(Path(os.path.relpath(path, root)).as_posix(), safe="/")
+    except ValueError as exc:
+        raise ValueError("asset and page must be on the same filesystem drive") from exc
 
 
 def fmt(value: Any) -> str:
@@ -283,7 +285,7 @@ def grid(items: Sequence[str], min_width: int = 280) -> Html:
 
 def tabs(panels: Sequence[tuple[str, str]], tab_id: str = "") -> Html:
     """Tabbed panels: [(label, html), ...]. First tab open."""
-    tab_id = tab_id or f"tabs{abs(hash(tuple(p[0] for p in panels))) % 10**8}"
+    tab_id = esc(tab_id or f"tabs-{uuid4().hex}")
     heads = "".join(f'<button type="button" class="tab{" on" if i == 0 else ""}" data-tab="{tab_id}-{i}">{esc(lbl)}</button>'
                     for i, (lbl, _) in enumerate(panels))
     bodies = "".join(f'<div class="tab-panel" id="{tab_id}-{i}"{"" if i == 0 else " hidden"}>{h}</div>'
@@ -402,7 +404,7 @@ def page(title: str, cards: Sequence[str], *, toc: Sequence[tuple] = (), subtitl
 <html lang="{esc(lang)}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)}</title>
-<script>document.documentElement.dataset.theme=localStorage.getItem("hv-theme")||(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")</script>
+<script>try{{document.documentElement.dataset.theme=localStorage.getItem("hv-theme")||(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")}}catch(_){{}}</script>
 <style>{CSS}</style></head>
 <body>
 <header class="topbar"><div class="topbar-in">
@@ -664,16 +666,31 @@ JS = r"""
 
   $("#hv-theme").onclick = () => {
     root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
-    localStorage.setItem("hv-theme", root.dataset.theme);
+    try { localStorage.setItem("hv-theme", root.dataset.theme); } catch (_) {}
   };
 
   // copy buttons
   $$(".codewrap").forEach(w => {
     const b = document.createElement("button");
     b.className = "copy"; b.type = "button"; b.textContent = "__COPY__";
-    b.onclick = () => navigator.clipboard?.writeText($("pre", w).innerText).then(() => {
-      b.textContent = "__COPIED__"; setTimeout(() => b.textContent = "__COPY__", 1200);
-    });
+    b.onclick = async () => {
+      const value = $("pre", w).innerText;
+      let copied = false;
+      try { await navigator.clipboard.writeText(value); copied = true; } catch (_) {
+        // LAN HTTP is not a secure context; use the browser's legacy copy path.
+        const area = document.createElement("textarea"); area.value = value;
+        area.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(area);
+        area.select();
+        try { copied = document.execCommand("copy"); } catch (_) {}
+        area.remove(); b.focus();
+      }
+      if (copied) {
+        b.textContent = "__COPIED__"; setTimeout(() => b.textContent = "__COPY__", 1200);
+      } else {
+        const selection = window.getSelection(), range = document.createRange();
+        range.selectNodeContents($("pre", w)); selection.removeAllRanges(); selection.addRange(range);
+      }
+    };
     w.appendChild(b);
   });
 
@@ -702,7 +719,9 @@ JS = r"""
   }));
 
   // filtering: search (cards + table rows) and facets (cards)
-  const cards = $$(".card"), rows = $$("tr[data-row]"), q = $("#hv-search"),
+  const allCards = $$(".card"), cards = allCards.filter(c => !$(".card", c)),
+        containers = allCards.filter(c => $(".card", c)),
+        rows = $$("tr[data-row]"), q = $("#hv-search"),
         count = $("#hv-count"), empty = $("#hv-empty");
   const tocFor = id => $(`.toc a[href="#${CSS.escape(id)}"]`);
   const sel = {};  // group -> Set(values)
@@ -713,18 +732,29 @@ JS = r"""
       $$(".pill", f).forEach(x => x.classList.toggle("on", x.dataset.val ? sel[g].has(x.dataset.val) : !sel[g].size));
       apply();
     }); });
-  const facetOk = c => { const tags = (c.dataset.tags || "").split("|");
-    return Object.entries(sel).every(([g, vs]) => !vs.size || [...vs].some(v => tags.includes(`${g}:${v}`))); };
+  const facetOk = c => {
+    const tags = [];
+    for (let node = c; node; node = node.parentElement?.closest(".card")) {
+      tags.push(...(node.dataset.tags || "").split("|"));
+    }
+    return Object.entries(sel).every(([g, vs]) => !vs.size || [...vs].some(v => tags.includes(`${g}:${v}`)));
+  };
   function apply() {
     const term = q.value.trim().toLowerCase(); let n = 0;
     cards.forEach(c => { const hit = facetOk(c) && (!term || c.textContent.toLowerCase().includes(term));
       c.classList.toggle("hidden", !hit); tocFor(c.id)?.classList.toggle("hidden", !hit); n += hit; });
+    // Wrappers around grids must remain visible when a descendant matches a facet.
+    containers.slice().reverse().forEach(c => {
+      const hit = $$(".card", c).some(child => !child.classList.contains("hidden"));
+      c.classList.toggle("hidden", !hit); tocFor(c.id)?.classList.toggle("hidden", !hit);
+    });
     rows.forEach(r => r.classList.toggle("hidden", !!term && !r.textContent.toLowerCase().includes(term)));
     const filtered = term || Object.values(sel).some(s => s.size);
     count.textContent = filtered ? `${n} / ${cards.length} __ITEMS__` : `${cards.length} __ITEMS__`;
     empty.hidden = n > 0;
   }
   let t; q.oninput = () => { clearTimeout(t); t = setTimeout(apply, 120); };
+  apply();
 
   // active TOC entry
   if ("IntersectionObserver" in window && $(".toc")) {
