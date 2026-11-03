@@ -8,7 +8,8 @@
 
 A [Claude Code](https://claude.com/claude-code) skill that turns local data into a
 good-looking web page or dashboard and serves it over a local HTTP server that
-is reachable from both this machine and the LAN. No session key by default.
+supports local and LAN access. No session key by default; cross-device access
+depends on routing and the firewall.
 
 ### What's inside
 
@@ -17,7 +18,7 @@ is reachable from both this machine and the LAN. No session key by default.
 | `SKILL.md` | When and how Claude uses the skill: workflow, design bar, serving rules. |
 | `scripts/quick_view.py` | Zero-code views for CSV/TSV, JSON/JSONL, logs, Markdown/text, images, directories. |
 | `scripts/viewer_kit.py` | Component library: theme (light/dark), sidebar TOC, search, facet filters, sortable tables, tabs, grids, galleries with lightbox, timelines, JSON highlighting. Outputs one self-contained HTML file, no CDN. |
-| `scripts/serve_viewer.py` | Serves a directory on `0.0.0.0` with no key, prints `VIEWER_URL` + reachable `LAN_URL`s (each probed at startup); `--local-only`, `--require-key`, `--lan-ip`, `--list` / `--stop`. |
+| `scripts/serve_viewer.py` | Serves a directory on `0.0.0.0` with no key, prints `VIEWER_URL` + `LAN_URL`s that pass a local startup probe; `--local-only`, `--require-key`, `--lan-ip`, `--list` / `--stop`. |
 | `references/page-recipe.md` | API reference and patterns (eval dashboard, record browser, A/B compare, image wall, timeline). |
 
 Python 3.8+, standard library only.
@@ -51,18 +52,34 @@ loopback URL with `localhost`.
 ### Security
 
 The viewer has **no authentication by default** and binds `0.0.0.0`, so any
-device on the same LAN that can reach the port can read the served directory.
+device that can reach the port can read the served directory. `0.0.0.0` includes
+VPN/public IPv4 interfaces if present; access is not restricted to the LAN.
 Only use it on a trusted network, serve a directory with no secrets, and stop it
 with `--stop PORT` when done. `--local-only` restricts it to this machine;
 `--require-key` adds a random `?key=...` gate (HTTP is plaintext, so the keyed
 URL is the credential). An OS firewall may prompt for permission to accept
-incoming connections.
+incoming connections. Hidden files and symlink targets are served too.
+
+Pass a literal, shell-quoted relative filename to `--page`, including Chinese or
+spaces; URLs are encoded automatically. LAN URLs pass a HEAD probe on the
+serving host, which does not prove that another device can connect. See
+[serving and troubleshooting](references/serving.md) for assets, keyed requests,
+SSH forwarding, and lifecycle details.
+
+### Validation
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Tests use temporary fixture directories and isolated viewer state. Network tests
+serve only synthetic content; no source data is uploaded.
 
 ---
 
 ## 中文
 
-一个 [Claude Code](https://claude.com/claude-code) skill：把本地任意数据（表格、JSON/JSONL、日志、图片目录、评测结果、轨迹……）做成好看的网页或看板，通过本机 HTTP 服务打开，本机与局域网都能访问，默认不带密钥。
+一个 [Claude Code](https://claude.com/claude-code) skill：把本地任意数据（表格、JSON/JSONL、日志、图片目录、评测结果、轨迹……）做成好看的网页或看板，通过本机 HTTP 服务打开，支持本机和局域网访问，默认不带密钥；跨设备可达性取决于路由和防火墙。
 
 ### 包含什么
 
@@ -99,4 +116,14 @@ python3 scripts/serve_viewer.py --dir . --page results.view.html
 
 ### 安全说明
 
-**默认不带任何鉴权**，且监听 `0.0.0.0`：同一局域网内能访问该端口的设备都可以读取被托管的目录。请只在可信内网使用，不要托管含密钥、令牌、`.env` 或凭据的目录，用完执行 `--stop 端口` 关闭。`--local-only` 可限制为仅本机访问；`--require-key` 可恢复随机 `?key=...` 密钥（HTTP 明文，带密钥的链接即凭证）。系统防火墙可能弹出「允许接受传入连接」的授权提示。
+**默认不带任何鉴权**，且监听 `0.0.0.0`：任何能访问该端口的设备都可以读取被托管的目录；`0.0.0.0` 包括可能存在的 VPN／公网 IPv4 网卡，并不限制为局域网。请只在可信内网使用，不要托管含密钥、令牌、`.env` 或凭据的目录，用完执行 `--stop 端口` 关闭。`--local-only` 可限制为仅本机访问；`--require-key` 可恢复随机 `?key=...` 密钥（HTTP 明文，带密钥的链接即凭证）。系统防火墙可能弹出「允许接受传入连接」的授权提示。
+
+`--page` 接收加 shell 引号的原始相对文件名，支持中文、空格及 `#`、`?`、`%`，无需自行 URL 编码。隐藏文件和软链接目标也能被 HTTP 访问；`--limit` 只限制页面展示数量，不限制 HTTP 可读文件。LAN 链接仅通过服务主机自身的 HEAD 探测，不代表其他设备已能连接。详见[服务与排错说明](references/serving.md)。
+
+### 验证
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+测试使用临时样例目录和独立服务状态；网络测试只托管合成数据，不上传业务内容。

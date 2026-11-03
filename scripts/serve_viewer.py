@@ -11,13 +11,14 @@ Pass --require-key to restore the original ?key=... gate.
 
 By default the server binds 0.0.0.0, so the page is reachable both from this
 machine and from other devices on the LAN. It prints a VIEWER_URL (loopback)
-and one LAN_URL per LAN IPv4 address that answers 200 from this host. Virtual /
-VPN-only addresses that cannot be reached are reported separately and never
-handed to the user as working URLs. Pass --local-only to restore loopback-only
+and one LAN_URL per local IPv4 address that answers 200 from this host.
+This self-probe does not verify access from another device (routing/firewalls).
+Failed probes are reported separately. Pass --local-only to restore loopback-only
 binding (no LAN_URL lines).
 
 WARNING: the default mode is unauthenticated AND reachable from the LAN. Anyone
-on the same network who can reach the port can read the served directory. Use it
+who can reach the port can read the served directory. Binding 0.0.0.0 includes
+VPN/public IPv4 interfaces if present. Use it
 only on a trusted LAN, serve a directory with no secrets, and stop the server
 when done. For access from another network, forward the loopback port over SSH:
     ssh -L PORT:127.0.0.1:PORT user@host
@@ -31,6 +32,7 @@ if sys.version_info < (3, 8):  # ThreadingHTTPServer, Path.unlink(missing_ok=)
     )
 
 import argparse  # noqa: E402 - after the version guard, so the error stays readable
+import errno
 import http.client
 import http.cookies
 import ipaddress
@@ -42,10 +44,12 @@ import signal
 import socket
 import subprocess
 import threading
+import tempfile
+import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 STATE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "claude-html-viewer"
 PORT_RANGE = range(8800, 8900)
@@ -60,11 +64,13 @@ def _remove_state(path):
     """Delete a state file, tolerating the cleanup/stop race (and strict shims)."""
     try:
         os.unlink(path)
-    except OSError:
+    except FileNotFoundError:
         pass
 
 
 def _alive(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -80,11 +86,19 @@ def _running():
         return out
     for path in sorted(STATE_DIR.glob("*.json")):
         try:
-            state = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                raise ValueError("invalid state")
+            pid, port = state.get("pid"), state.get("port")
+            if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                    or not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535
+                    or path.name != f"{port}.json"
+                    or not all(isinstance(state.get(k), str) for k in ("dir", "url"))):
+                raise ValueError("invalid state")
+        except (OSError, ValueError):
             _remove_state(path)
             continue
-        if _alive(int(state.get("pid", -1))):
+        if _alive(state["pid"]):
             out.append(state)
         else:
             _remove_state(path)  # died without cleaning up
@@ -97,7 +111,7 @@ def _usable_lan_ip(text):
         addr = ipaddress.ip_address(text)
     except ValueError:
         return False
-    return not (
+    return isinstance(addr, ipaddress.IPv4Address) and not (
         addr.is_loopback
         or addr.is_link_local
         or addr.is_unspecified
@@ -155,30 +169,66 @@ def _lan_ips(extra=None):
 
 
 def _http_ok(host, port, path):
-    """Probe a candidate LAN URL through the running server; only 200 counts."""
+    """A local HEAD probe; this cannot verify access from a different device."""
+    conn = http.client.HTTPConnection(host, port, timeout=1.5)
     try:
-        conn = http.client.HTTPConnection(host, port, timeout=1.5)
         conn.request("HEAD", path)
-        ok = conn.getresponse().status == 200
-        conn.close()
-        return ok
+        response = conn.getresponse()
+        return response.status == 200
     except (OSError, http.client.HTTPException):
         return False
+    finally:
+        conn.close()
 
 
-def _free_port(preferred, bind_host):
-    candidates = [preferred] if preferred else list(PORT_RANGE)
+class ViewerServer(ThreadingHTTPServer):
+    # On macOS, SO_REUSEADDR can let a wildcard listener overlap a loopback
+    # listener. Probes then reach the other server, and state/stop target the
+    # wrong viewer. Each port must have a single owner across bind addresses.
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+
+def _bind_server(preferred, bind_host, handler):
+    # Bind the actual server, avoiding a check-then-bind race with other viewers.
+    candidates = [preferred] if preferred is not None else PORT_RANGE
     for port in candidates:
-        with socket.socket() as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.bind((bind_host, port))
-            except OSError:
-                continue
-        return port
-    if preferred:
+        try:
+            return ViewerServer((bind_host, port), handler)
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+    if preferred is not None:
         sys.exit(f"port {preferred} is already in use")
     sys.exit(f"no free port in {PORT_RANGE.start}-{PORT_RANGE.stop - 1}")
+
+
+def _page_path(directory, page):
+    """Treat --page as a literal relative filename, not an already encoded URL."""
+    entry = Path(page)
+    if entry.is_absolute() or ".." in entry.parts:
+        raise ValueError("--page must be a relative path inside --dir")
+    target = directory / entry
+    if not target.exists():
+        raise ValueError(f"entry page not found: {target}")
+    path = "/" + quote(entry.as_posix(), safe="/")
+    if target.is_dir() and not path.endswith("/"):
+        path += "/"
+    return path
+
+
+def _write_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    # The temporary file is private from creation; replace publishes complete JSON.
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=STATE_DIR,
+                                     prefix=".viewer-", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            json.dump(state, stream, indent=1)
+            stream.close()
+            os.replace(temporary, _state_path(state["port"]))
+        finally:
+            _remove_state(temporary)
 
 
 class ViewerHandler(SimpleHTTPRequestHandler):
@@ -217,7 +267,8 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def do_GET(self):
         if not self._authorized():
@@ -230,92 +281,123 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         super().do_HEAD()
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+        # Keyed URLs are credentials; keep them out of request logs.
+        message = re.sub(r"\?[^\s\"]*", "?[redacted]", fmt % args)
+        message = "".join(c if c >= " " and c != "\x7f" else "?" for c in message)
+        sys.stderr.write("%s %s\n" % (self.address_string(), message))
 
 
 def serve(directory, page, port, local_only=False, lan_ip_extra=None, require_key=False):
-    directory = directory.resolve()
+    directory = directory.expanduser().resolve()
     if not directory.is_dir():
         sys.exit(f"not a directory: {directory}")
+    try:
+        path = _page_path(directory, page)
+    except ValueError as exc:
+        sys.exit(str(exc))
     bind_host = "127.0.0.1" if local_only else "0.0.0.0"
-    port = _free_port(port, bind_host)
     key = secrets.token_urlsafe(16) if require_key else ""
+    if key:
+        path += f"?key={key}"
     handler = partial(
         type("Handler", (ViewerHandler,), {"key": key, "require_key": require_key}),
         directory=str(directory),
     )
-    httpd = ThreadingHTTPServer((bind_host, port), handler)
+    httpd = _bind_server(port, bind_host, handler)
+    port = httpd.server_port
     httpd.daemon_threads = True
     server_thread = threading.Thread(target=httpd.serve_forever, name="viewer-httpd", daemon=True)
-    server_thread.start()
-
-    path = f"/{page}" + (f"?key={key}" if key else "")
-    lan_urls, unreachable = [], []
-    if not local_only:
-        for ip in _lan_ips(lan_ip_extra):
-            if _http_ok(ip, port, path):
-                lan_urls.append(f"http://{ip}:{port}{path}")
-            else:
-                unreachable.append(ip)
-
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    state = {
-        "pid": os.getpid(),
-        "port": port,
-        "dir": str(directory),
-        "page": page,
-        "bind": bind_host,
-        "require_key": require_key,
-        "url": f"http://127.0.0.1:{port}{path}",
-        "lan_urls": lan_urls,
-        "unreachable_lan_ips": unreachable,
-    }
-    _state_path(port).write_text(json.dumps(state, indent=1))
-    _state_path(port).chmod(0o600)
+    stopping = threading.Event()
 
     def cleanup(*_args):
-        _remove_state(_state_path(port))
-        threading.Thread(target=httpd.shutdown, daemon=True).start()
+        if not stopping.is_set():
+            stopping.set()
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
 
-    signal.signal(signal.SIGTERM, cleanup)
-    signal.signal(signal.SIGINT, cleanup)
-
-    auth = "key" if require_key else "none"
-    print(f"serving {directory} (bind {bind_host}, auth {auth})")
-    print(f"VIEWER_URL {state['url']}", flush=True)
-    for url in lan_urls:
-        print(f"LAN_URL    {url}", flush=True)
-    for ip in unreachable:
-        print(
-            f"LAN_URL_UNREACHABLE {ip} (detected but not reachable; omitted from handover)",
-            flush=True,
-        )
-    if local_only:
-        print("LAN_URL    disabled (--local-only): server is loopback only", flush=True)
-    elif not lan_urls:
-        print(
-            "LAN_URL    none reachable - check the OS firewall, or add an address "
-            "with --lan-ip IP",
-            flush=True,
-        )
-    if require_key:
-        print(
-            "note: URLs carry the session key; HTTP is plaintext, do not share the "
-            "keyed URL publicly.",
-            flush=True,
-        )
-    else:
-        print(
-            "note: NO AUTHENTICATION - anyone who can reach this port can read the "
-            "served directory. Trusted LAN only; stop with --stop when done.",
-            flush=True,
-        )
-    print(f"stop with: {sys.argv[0]} --stop {port}", flush=True)
+    previous_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    server_thread.start()
+    for sig in previous_handlers:
+        signal.signal(sig, cleanup)
     try:
+        lan_urls, unreachable = [], []
+        if not local_only:
+            for ip in _lan_ips(lan_ip_extra):
+                if stopping.is_set():
+                    return 0
+                if _http_ok(ip, port, path):
+                    lan_urls.append(f"http://{ip}:{port}{path}")
+                else:
+                    unreachable.append(ip)
+        if stopping.is_set():
+            return 0
+        state = {
+            "version": 2,
+            "pid": os.getpid(),
+            "port": port,
+            "dir": str(directory),
+            "page": page,
+            "bind": bind_host,
+            "require_key": require_key,
+            "url": f"http://127.0.0.1:{port}{path}",
+            "lan_urls": lan_urls,
+            "unreachable_lan_ips": unreachable,
+        }
+        _write_state(state)
+        auth = "key" if require_key else "none"
+        print(f"serving {directory} (bind {bind_host}, auth {auth})")
+        print(f"VIEWER_URL {state['url']}", flush=True)
+        for url in lan_urls:
+            print(f"LAN_URL {url}", flush=True)
+        for ip in unreachable:
+            print(f"LAN_URL_UNREACHABLE {ip} (local probe failed)", flush=True)
+        if local_only:
+            print("note: loopback only (--local-only).", flush=True)
+        elif lan_urls:
+            print("note: LAN URLs passed a probe on this host; access from another device "
+                  "depends on routing and the inbound firewall.", flush=True)
+        else:
+            print("note: no LAN URL passed the local probe; check interfaces/firewall "
+                  "or add a local IPv4 with --lan-ip IP.", flush=True)
+        if require_key:
+            print("note: URLs carry the session key; HTTP is plaintext.", flush=True)
+        else:
+            print("note: NO AUTHENTICATION - anyone who can reach this port can read "
+                  "the served directory.", flush=True)
+        if not local_only:
+            print("note: 0.0.0.0 listens on ALL IPv4 interfaces, including VPN/public "
+                  "interfaces if present. Trusted networks only.", flush=True)
+        print(f"stop with: {sys.argv[0]} --stop {port}", flush=True)
         server_thread.join()
     finally:
+        httpd.shutdown()
+        server_thread.join()
+        httpd.server_close()
         _remove_state(_state_path(port))
+        for sig, previous in previous_handlers.items():
+            signal.signal(sig, previous)
     return 0
+
+
+def _port_number(text):
+    try:
+        port = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be an integer in 1-65535")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be in 1-65535")
+    return port
+
+
+def _local_ipv4(text):
+    if not _usable_lan_ip(text):
+        raise argparse.ArgumentTypeError("--lan-ip needs a non-loopback unicast IPv4 address")
+    # Never send a session key to an arbitrary remote host during a probe.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.bind((text, 0))
+    except OSError:
+        raise argparse.ArgumentTypeError("--lan-ip must be assigned to this host")
+    return text
 
 
 def main():
@@ -323,12 +405,12 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dir", type=Path, help="directory to serve")
     parser.add_argument("--page", default="index.html", help="entry page (default index.html)")
-    parser.add_argument("--port", type=int, help="fixed port; default is the first free one")
+    parser.add_argument("--port", type=_port_number, help="fixed port; default is the first free one")
     parser.add_argument("--local-only", action="store_true",
                         help="bind 127.0.0.1 only; no LAN URLs")
     parser.add_argument("--require-key", action="store_true",
                         help="gate every request behind a random ?key=... session key")
-    parser.add_argument("--lan-ip", action="append", metavar="IP",
+    parser.add_argument("--lan-ip", action="append", type=_local_ipv4, metavar="IP",
                         help="extra LAN IP to probe as a LAN_URL (repeatable)")
     parser.add_argument("--list", action="store_true", help="list running viewers")
     parser.add_argument("--stop", metavar="PORT|all", help="stop a running viewer")
@@ -339,7 +421,7 @@ def main():
         if not running:
             print("no viewer running")
         for state in running:
-            auth = "key" if state.get("require_key") else "none"
+            auth = "key" if state.get("require_key", True) else "none"
             print(f"port {state['port']}  pid {state['pid']}  "
                   f"bind {state.get('bind', '127.0.0.1')}  auth {auth}  {state['dir']}")
             print(f"  {state['url']}")
@@ -356,14 +438,22 @@ def main():
                 return 1
         for state in running:
             pid, stopped_port = int(state["pid"]), int(state["port"])
-            _remove_state(_state_path(stopped_port))  # remove before the child cleans up
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
-                pass
+                _remove_state(_state_path(stopped_port))
+            deadline = time.monotonic() + 3
+            while _state_path(stopped_port).exists() and _alive(pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if _state_path(stopped_port).exists() and _alive(pid):
+                print(f"stop requested for port {stopped_port}; shutdown not confirmed", file=sys.stderr)
+                return 1
+            _remove_state(_state_path(stopped_port))
             print(f"stopped port {stopped_port}")
         return 0
 
+    if args.local_only and args.lan_ip:
+        parser.error("--lan-ip cannot be combined with --local-only")
     if not args.dir:
         parser.error("--dir is required (or use --list / --stop)")
     return serve(args.dir, args.page, args.port, args.local_only,

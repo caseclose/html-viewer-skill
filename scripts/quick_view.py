@@ -25,7 +25,8 @@ import json
 import os
 import re
 import sys
-from collections import Counter
+import shlex
+from collections import Counter, deque
 from datetime import datetime
 from pathlib import Path
 
@@ -96,7 +97,7 @@ def records_page(path: Path, root: Path, recs: list, title: str) -> str:
     base = path.parent
 
     # status / facet candidates
-    status_key = next((k for k in keys if k in STATUS_KEYS or k.lower() in STATUS_KEYS), None)
+    status_key = next((k for k in keys if k in STATUS_KEYS or str(k).lower() in STATUS_KEYS), None)
     statuses = [status_of(r.get(status_key)) if status_key else None for r in dicts]
     facet_keys = []
     for k in keys:
@@ -133,7 +134,7 @@ def records_page(path: Path, root: Path, recs: list, title: str) -> str:
                 else:
                     row.append(v)
             rows.append(row)
-        body = vk.table(cols, rows, row_kinds=[("fail" if s == "fail" else "") for s in statuses])
+        body = vk.table(cols, rows, max_rows=len(rows), row_kinds=[("fail" if s == "fail" else "") for s in statuses])
         card = vk.card("table", "", path.name, body, chips=[("rows", len(dicts)), ("columns", len(cols))])
         return vk.page(title, [card], subtitle=str(path), summary_html=summary, wide=True)
 
@@ -178,22 +179,36 @@ def csv_page(path: Path, root: Path, title: str, limit: int) -> str:
     delim = "\t" if path.suffix.lower() == ".tsv" else ","
     with path.open(encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter=delim)
-        recs = [row for _, row in zip(range(limit), reader)]
+        fields = reader.fieldnames or []
+        if not fields or any(not field.strip() for field in fields) or len(set(fields)) != len(fields):
+            raise ValueError("CSV/TSV needs nonempty, unique column names")
+        recs = []
+        for _, row in zip(range(limit), reader):
+            if None in row:
+                raise ValueError(f"CSV/TSV row {reader.line_num} has more cells than the header")
+            recs.append(row)
     for r in recs:  # numbers sort as numbers
         for k, v in r.items():
             try:
-                r[k] = int(v) if re.fullmatch(r"-?\d+", v or "") else float(v) if re.fullmatch(r"-?[\d.]+(e[-+]?\d+)?", (v or ""), re.I) else v
+                # Preserve identifiers such as 00123; parse only unambiguous numbers.
+                if re.fullmatch(r"-?(?:0|[1-9]\d*)", v or ""):
+                    r[k] = int(v)
+                elif re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)(?:e[-+]?\d+)?|-?(?:0|[1-9]\d*)e[-+]?\d+", v or "", re.I):
+                    r[k] = float(v)
             except (TypeError, ValueError):
                 pass
     return records_page(path, root, recs, title)
 
 
 def log_page(path: Path, root: Path, title: str, limit: int) -> str:
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    total = len(lines)
+    lines = deque(maxlen=limit)
+    total = 0
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for total, line in enumerate(stream, 1):
+            lines.append((total, line.rstrip("\r\n")))
     start = max(0, total - limit)  # logs: the tail matters most
     rows, kinds, counts = [], [], Counter()
-    for i, line in enumerate(lines[start:], start + 1):
+    for i, line in lines:
         m = LEVEL.search(line[:200])
         level = m.group(1) if m else ""
         counts[level or "—"] += 1
@@ -241,6 +256,8 @@ def dir_page(path: Path, root: Path, title: str, limit: int, out: Path) -> str:
                 groups.setdefault(Path(dirpath), []).append(p)
             else:
                 files.append(p)
+            if sum(map(len, groups.values())) + len(files) >= limit:
+                break
         if sum(map(len, groups.values())) + len(files) >= limit:
             break
 
@@ -259,7 +276,7 @@ def dir_page(path: Path, root: Path, title: str, limit: int, out: Path) -> str:
         rows = [[vk.link(vk.rel(p, root), str(p.relative_to(path))), p.suffix.lstrip(".") or "—",
                  vk.raw(f'<span data-v="{p.stat().st_size}">{human(p.stat().st_size)}</span>'),
                  datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")] for p in files]
-        cards.append(vk.card("files", "", "files", vk.table(["path", "type", "size", "modified"], rows),
+        cards.append(vk.card("files", "", "files", vk.table(["path", "type", "size", "modified"], rows, max_rows=limit),
                              chips=[("files", len(files))]))
         toc.append(("files", "files"))
     n_img = sum(map(len, groups.values()))
@@ -269,13 +286,25 @@ def dir_page(path: Path, root: Path, title: str, limit: int, out: Path) -> str:
 
 # --------------------------------------------------------------------- main
 
+def _positive_limit(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("--limit must be positive")
+    return value
+
+
+def _looks_like_log(path):
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        return LEVEL.search(stream.read(20000))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input", type=Path)
     ap.add_argument("--out", type=Path, help="output HTML (default: next to the input)")
     ap.add_argument("--title")
     ap.add_argument("--lang", default="zh", choices=["zh", "en"])
-    ap.add_argument("--limit", type=int, default=2000, help="max records / lines / files (default 2000)")
+    ap.add_argument("--limit", type=_positive_limit, default=2000, help="max records / lines / files (default 2000)")
     args = ap.parse_args()
 
     src = args.input.expanduser().resolve()
@@ -283,7 +312,9 @@ def main() -> int:
         sys.exit(f"not found: {src}")
     vk.set_lang(args.lang)
     root_default = src if src.is_dir() else src.parent
-    out = (args.out or root_default / f"{src.stem if src.is_file() else 'index'}.view.html").resolve()
+    out = (args.out or root_default / f"{src.stem if src.is_file() else 'index'}.view.html").expanduser().resolve()
+    if out == src:
+        ap.error("--out must not overwrite the input")
     root = out.parent
     title = args.title or src.name
     ext = src.suffix.lower()
@@ -294,18 +325,25 @@ def main() -> int:
         html = records_page(src, root, load_records(src, args.limit), title)
     elif ext in (".csv", ".tsv"):
         html = csv_page(src, root, title, args.limit)
-    elif ext in (".log", ".out", ".err") or (ext == ".txt" and LEVEL.search(src.read_text(errors="replace")[:20000])):
+    elif ext in (".log", ".out", ".err") or (ext == ".txt" and _looks_like_log(src)):
         html = log_page(src, root, title, args.limit)
     elif ext in IMG_EXT:
         html = vk.page(title, [vk.card("img", "", src.name, vk.gallery([(src, src.name)], root, hero=True))])
     else:
         html = text_page(src, root, title)
 
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")
     print(f"wrote {out}")
-    print(f"serve with: python3 {Path(__file__).with_name('serve_viewer.py')} --dir {root} --page {out.name}")
+    print(f"selection: up to {args.limit} records/files, or the last {args.limit} log lines; counts describe the loaded selection")
+    command = [sys.executable, str(Path(__file__).with_name("serve_viewer.py")),
+               "--dir", str(root), "--page", out.name]
+    print("serve with: " + " ".join(shlex.quote(part) for part in command))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError) as exc:
+        sys.exit(f"cannot build view: {exc}")
