@@ -1,6 +1,6 @@
 ---
 name: html-viewer
-description: Build a good-looking local web page or dashboard from any data and serve it over a key-gated localhost HTTP server — tables of results, metrics and eval summaries, experiment/run comparisons, JSON/JSONL/CSV records, logs, image sets and A/B comparisons, traces and timelines, directory listings, reports. Use when the user asks to "show me", "visualize", "make a dashboard / 看板", "open it in a web page / browser", "用网页展示", "起个 http 服务看看", or when a result is too large, nested, or image-heavy to read in the terminal. Also covers listing and stopping running viewers. Not for publishing to an external service; for chart design itself, also load dataviz.
+description: Build a good-looking local web page or dashboard from any data and serve it over a local HTTP server that prints both loopback and LAN URLs (no key by default; optional --require-key) — tables of results, metrics and eval summaries, experiment/run comparisons, JSON/JSONL/CSV records, logs, image sets and A/B comparisons, traces and timelines, directory listings, reports. Use when the user asks to "show me", "visualize", "make a dashboard / 看板", "open it in a web page / browser", "用网页展示", "起个 http 服务看看", or when a result is too large, nested, or image-heavy to read in the terminal. Also covers listing and stopping running viewers. Not for publishing to an external service; for chart design itself, also load dataviz.
 ---
 
 # HTML viewer
@@ -12,7 +12,7 @@ served from their own machine. Three pieces, all in `scripts/`:
 |---|---|
 | `quick_view.py` | Zero-code: renders a CSV/TSV, JSON/JSONL, log, Markdown/text file, image, or directory into a page. |
 | `viewer_kit.py` | The component library: theme, layout, tables, cards, tabs, filters, galleries, timelines. Build scripts import it. |
-| `serve_viewer.py` | Serves a directory on 127.0.0.1 with a per-session key; lists and stops viewers. |
+| `serve_viewer.py` | Serves a directory over a local HTTP server (no key by default), prints loopback + LAN URLs; lists and stops viewers. |
 
 `SKILL_DIR` below means the directory containing this `SKILL.md` (for a personal
 install, `~/.claude/skills/html-viewer`); substitute its absolute path in the
@@ -63,42 +63,51 @@ patterns for common dashboards, and gotchas: `references/page-recipe.md`.
 ### 4. Serve it
 
 ```bash
-python3 $SKILL_DIR/scripts/serve_viewer.py --dir <DIR> [--page page.html]
+python3 $SKILL_DIR/scripts/serve_viewer.py --dir <DIR> [--page page.html] [--local-only] [--require-key]
 ```
 
-Run in the background (`run_in_background: true`) and read the `VIEWER_URL ...`
-line — that URL carries the session key and is what you give the user. Default
-port is the first free one in 8800–8899; `--port` fixes it.
+Run in the background (`run_in_background: true`) and read the output. It prints
+one `VIEWER_URL` (loopback) and one `LAN_URL` per LAN IPv4 address that answers
+200 from this host; unreachable virtual/VPN addresses appear as
+`LAN_URL_UNREACHABLE` and must not be handed to the user as working links.
+**Hand the user both kinds of URL.** URLs are plain `http://host:port/page.html`
+with no key. Default port is the first free one in 8800–8899; `--port` fixes it.
+`--lan-ip IP` adds an address auto-detection missed; `--local-only` restricts
+the server to `127.0.0.1`; `--require-key` restores a random `?key=...` gate.
 
-The server binds `127.0.0.1` only and requires the key on every request.
-**Serve the directory holding the page and the files it links to, nothing
-wider** — check it doesn't contain tokens, keys, `.env`, or credentials. If assets
-live elsewhere, symlink them in or serve a common parent.
+By default the server binds `0.0.0.0` with **no authentication**. Anyone on the
+same LAN who can reach the port can read the served directory. Use it only on a
+trusted network, never serve a directory containing tokens, keys, `.env`, or
+credentials, and stop the server when done. If the OS firewall blocks incoming
+connections, the user must allow it locally. **Serve the directory holding the
+page and the files it links to, nothing wider** — if assets live elsewhere,
+symlink them in or serve a common parent.
 
 ### 5. Verify, then hand over
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" "<VIEWER_URL>"
+curl -s -o /dev/null -w "%{http_code}\n" "<LAN_URL>"
 ```
 
-and fetch one image the page references (same `?key=`). Then give the user the
-URL, one line on what's on the page, and how to stop it.
+and fetch one image the page references. Then give the user both URLs, one line
+on what's on the page, and how to stop it. The script probes each candidate IP
+at startup, but still verify the URL you hand over; if a LAN URL is not reachable
+(firewall, wrong subnet), say so explicitly instead of presenting it as working.
 
-### 6. Remote machines
+### 6. Other networks
 
-If the user's browser isn't on the serving machine, give them an SSH tunnel:
+Same LAN → open the `LAN_URL` directly; no tunnel needed.
+
+Different network / internet → forward the loopback port over SSH and open the
+loopback URL on the remote machine:
 `ssh -L <PORT>:127.0.0.1:<PORT> user@<host>`, then
-`http://localhost:<PORT>/<page>?key=...`.
+`http://localhost:<PORT>/<page>`.
 
-If they want it open to the network instead, that's their decision and their
-command to run — it exposes the directory to everyone who can reach the host. Give
-them the command (in Claude Code, prefix with `!`) instead of starting it yourself:
-
-```
-! nohup python3 -m http.server <PORT> --bind 0.0.0.0 --directory <DIR> >/tmp/viewer.log 2>&1 &
-```
-
-Say that this plain server has no key, and remind them to stop it when done.
+Never leave an unauthenticated viewer on an untrusted network. If the page must
+be reachable beyond a trusted LAN, add `--require-key` (and prefer the SSH
+tunnel) so the URL carries a session key; remind the user that HTTP is plaintext
+and the keyed URL is the credential.
 
 ## Design bar
 
@@ -138,12 +147,17 @@ python3 $SKILL_DIR/scripts/serve_viewer.py --list
 python3 $SKILL_DIR/scripts/serve_viewer.py --stop <PORT>    # or --stop all
 ```
 
-Check `--list` before starting another. Ports held by other processes are skipped
-automatically; leave those alone.
+`--list` shows the bind address, auth mode and every printed URL. Check `--list`
+before starting another. Ports held by other processes are skipped automatically;
+leave those alone.
 
 ## Rules
 
 - **Never upload the content** to an external service to make it viewable.
+- **Give both URLs.** Hand over the loopback `VIEWER_URL` and at least one
+  `LAN_URL`; verify before claiming a LAN URL works.
+- **No key by default.** The default server is unauthenticated and LAN-reachable;
+  trusted networks only, only a directory with no secrets, stop it when done.
 - **Link files, don't inline them.** Relative paths to images; no base64 of large
   files.
 - **Keep the build script** next to the output and tell the user the one-line
