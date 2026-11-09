@@ -205,7 +205,8 @@ class ServerTests(Fixture):
             occupied.bind(("127.0.0.1", 0))
             occupied.listen()
             busy = occupied.getsockname()[1]
-            with mock.patch.object(sv, "PORT_RANGE", [busy, 0]):
+            with mock.patch.object(sv, "PORT_RANGE", [busy, 0]), \
+                    mock.patch.object(sv.socket, "getfqdn", side_effect=AssertionError("unexpected getfqdn")):
                 server = sv._bind_server(None, "127.0.0.1", sv.ViewerHandler)
                 try:
                     self.assertNotEqual(server.server_port, busy)
@@ -213,17 +214,17 @@ class ServerTests(Fixture):
                     server.server_close()
 
     def test_wildcard_does_not_overlap_reusable_loopback_listener(self):
-        occupied = sv.ThreadingHTTPServer(("127.0.0.1", 0), sv.ViewerHandler)
-        try:
-            busy = occupied.server_port
+        with socket.socket() as occupied:
+            occupied.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            busy = occupied.getsockname()[1]
             with mock.patch.object(sv, "PORT_RANGE", [busy, 0]):
                 server = sv._bind_server(None, "0.0.0.0", sv.ViewerHandler)
                 try:
                     self.assertNotEqual(server.server_port, busy)
                 finally:
                     server.server_close()
-        finally:
-            occupied.server_close()
 
     def test_probe_failure_does_not_break_local_viewer(self):
         self.file()

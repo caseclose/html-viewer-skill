@@ -42,6 +42,7 @@ import re
 import secrets
 import signal
 import socket
+import socketserver
 import subprocess
 import threading
 import tempfile
@@ -187,6 +188,14 @@ class ViewerServer(ThreadingHTTPServer):
     # wrong viewer. Each port must have a single owner across bind addresses.
     allow_reuse_address = False
     allow_reuse_port = False
+
+    def server_bind(self):
+        # Skip HTTPServer.server_bind's socket.getfqdn(), which can block for
+        # 30+ seconds on macOS when reverse DNS is unavailable.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
 
 def _bind_server(preferred, bind_host, handler):
